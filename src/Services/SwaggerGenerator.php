@@ -16,6 +16,7 @@ use Laravel\AutoSwagger\Attributes\ApiModel;
 use Laravel\AutoSwagger\Attributes\ApiOperation;
 use Laravel\AutoSwagger\Attributes\ApiParameter;
 use Laravel\AutoSwagger\Attributes\ApiProperty;
+use Laravel\AutoSwagger\Attributes\ApiRequestBody;
 use Laravel\AutoSwagger\Attributes\ApiResponse;
 use Laravel\AutoSwagger\Attributes\ApiResource;
 use Laravel\AutoSwagger\Attributes\ApiSecurity;
