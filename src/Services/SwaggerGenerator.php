@@ -22,6 +22,7 @@ use Laravel\AutoSwagger\Attributes\ApiResource;
 use Laravel\AutoSwagger\Attributes\ApiSecurity;
 use Laravel\AutoSwagger\Attributes\ApiSwagger;
 use Laravel\AutoSwagger\Attributes\ApiTag;
+use Laravel\AutoSwagger\Helpers\PathParameterExtractor;
 use ReflectionAttribute;
 use ReflectionClass;
 use ReflectionMethod;
@@ -110,6 +111,11 @@ class SwaggerGenerator
     {
         $this->scanModels();
         $this->scanControllers($this->config['scan']['controllers_path']);
+        
+        if (!empty($this->config['scan']['analyze_routes']) && $this->config['scan']['analyze_routes']) {
+            $this->analyzeRoutes();
+        }
+        
         return $this->openApiDoc;
     }
 
@@ -133,19 +139,8 @@ class SwaggerGenerator
                 continue;
             }
             
-            // If PHPDoc scanning is enabled in config
-            if (isset($this->config['scan']['use_phpdoc']) && $this->config['scan']['use_phpdoc']) {
-                // Process models with ApiModel attributes first, then try PHPDoc for all models
-                $this->processModelClass($className);
-            } else {
-                // Only process models that have explicit ApiModel attributes
-                $reflectionClass = new ReflectionClass($className);
-                $apiModelAttributes = $reflectionClass->getAttributes(ApiModel::class, ReflectionAttribute::IS_INSTANCEOF);
-                
-                if (!empty($apiModelAttributes)) {
-                    $this->processModelClass($className);
-                }
-            }
+            // Process model class
+            $this->processModelClass($className);
         }
     }
 
@@ -159,10 +154,12 @@ class SwaggerGenerator
         }
         
         $reflectionClass = new ReflectionClass($className);
+        
+        // Check for ApiModel attribute
         $apiModelAttributes = $reflectionClass->getAttributes(ApiModel::class, ReflectionAttribute::IS_INSTANCEOF);
         
-        // If no ApiModel attributes found, try extracting from PHPDoc
         if (empty($apiModelAttributes)) {
+            // No explicit ApiModel attribute, try to extract from PHPDoc
             $this->processModelFromPhpDoc($className);
             return;
         }
@@ -186,50 +183,43 @@ class SwaggerGenerator
             }
             
             $apiProperty = $apiPropertyAttributes[0]->newInstance();
+            
+            // Skip hidden properties
+            if ($apiProperty->hidden) {
+                continue;
+            }
+            
+            // Get property name
             $propertyName = $property->getName();
             
-            $propertySchema = $this->getPropertySchema($apiProperty);
+            // Add to schema
+            $schema['properties'][$propertyName] = $this->getPropertySchema($apiProperty);
             
-            $schema['properties'][$propertyName] = $propertySchema;
-            
+            // Add to required properties if needed
             if ($apiProperty->required) {
                 $required[] = $propertyName;
             }
         }
         
+        // Add required properties if any
         if (!empty($required)) {
             $schema['required'] = $required;
         }
         
-        $this->openApiDoc['components']['schemas'][class_basename($className)] = $schema;
+        // Add to components schemas
+        $schemaName = $apiModel->name ?: class_basename($className);
+        $this->openApiDoc['components']['schemas'][$schemaName] = $schema;
     }
-    
+
     /**
      * Process a model class using PHPDoc comments.
      */
     protected function processModelFromPhpDoc(string $className): void
     {
-        $phpDocParser = new PhpDocParser();
-        $schema = $phpDocParser->parseModelDocBlock($className);
+        // This is where you would parse PHPDoc to extract property information
+        // This could use reflection and docblock parsing libraries
         
-        if (empty($schema) || empty($schema['properties'])) {
-            return;
-        }
-        
-        // Extract required properties
-        $required = [];
-        foreach ($schema['properties'] as $propertyName => $propertySchema) {
-            if (isset($propertySchema['required']) && $propertySchema['required'] === true) {
-                $required[] = $propertyName;
-                unset($schema['properties'][$propertyName]['required']);
-            }
-        }
-        
-        if (!empty($required)) {
-            $schema['required'] = $required;
-        }
-        
-        $this->openApiDoc['components']['schemas'][class_basename($className)] = $schema;
+        // For now, we'll skip this if there's no ApiModel attribute
     }
 
     /**
@@ -237,27 +227,34 @@ class SwaggerGenerator
      */
     protected function getPropertySchema(ApiProperty $apiProperty): array
     {
-        $typeInfo = $this->typeMap[$apiProperty->type] ?? ['type' => $apiProperty->type];
-        
-        $schema = [
-            'type' => $typeInfo['type'],
-            'description' => $apiProperty->description,
-        ];
-        
-        if (isset($typeInfo['format']) || $apiProperty->format) {
-            $schema['format'] = $apiProperty->format ?? $typeInfo['format'];
+        if ($apiProperty->schema) {
+            return $apiProperty->schema;
         }
         
-        if ($apiProperty->nullable) {
-            $schema['nullable'] = true;
+        $schema = [];
+        
+        // Handle type
+        if ($apiProperty->type) {
+            $typeInfo = $this->typeMap[$apiProperty->type] ?? ['type' => $apiProperty->type];
+            $schema = array_merge($schema, $typeInfo);
+        }
+        
+        // Handle other properties
+        if ($apiProperty->description) {
+            $schema['description'] = $apiProperty->description;
+        }
+        
+        if ($apiProperty->example !== null) {
+            $schema['example'] = $apiProperty->example;
         }
         
         if ($apiProperty->enum) {
             $schema['enum'] = $apiProperty->enum;
         }
         
-        if ($apiProperty->example !== null) {
-            $schema['example'] = $apiProperty->example;
+        // Handle items for array type
+        if (($apiProperty->type === 'array' || $schema['type'] === 'array') && $apiProperty->items) {
+            $schema['items'] = $apiProperty->items;
         }
         
         return $schema;
@@ -268,31 +265,22 @@ class SwaggerGenerator
      */
     protected function scanControllers(string $path): void
     {
-        // First approach: Scan controller files
-        $finder = new Finder();
-        $finder->files()->name('*.php')->in($path);
-
-        // Add include patterns if they exist in config
-        if ($includePatterns = Config::get('auto-swagger.scan.include_patterns', [])) {
-            $finder->path($includePatterns);
-        }
-
-        // Add exclude patterns if they exist in config
-        if ($excludePatterns = Config::get('auto-swagger.scan.exclude_patterns', [])) {
-            $finder->notPath($excludePatterns);
-        }
-
-        foreach ($finder as $file) {
-            $className = $this->getClassNameFromFile($file->getRealPath());
-
-            if ($className) {
-                $this->processControllerClass($className);
-            }
+        if (!file_exists($path)) {
+            return;
         }
         
-        // Second approach: Analyze routes (if enabled)
-        if (Config::get('auto-swagger.scan.analyze_routes', false)) {
-            $this->analyzeRoutes();
+        $controllerFinder = new Finder();
+        $controllerFinder->files()->in($path)->name('*.php');
+        
+        foreach ($controllerFinder as $file) {
+            $className = $this->getClassNameFromFile($file->getRealPath());
+            
+            if (!$className) {
+                continue;
+            }
+            
+            // Process controller class
+            $this->processControllerClass($className);
         }
     }
 
@@ -301,70 +289,62 @@ class SwaggerGenerator
      */
     protected function processControllerClass(string $className): void
     {
-        // Skip processing if the class name is not a controller
-        if (!class_exists($className) || !str_contains($className, 'Controller')) {
-            return;
-        }
-
-        $reflectionClass = new ReflectionClass($className);
-
-        if ($reflectionClass->isAbstract()) {
+        if (!class_exists($className)) {
             return;
         }
         
-        // Check if class has ApiSwagger(false) to exclude it
-        $apiSwaggerAttrs = $reflectionClass->getAttributes(ApiSwagger::class, ReflectionAttribute::IS_INSTANCEOF);
-        if (!empty($apiSwaggerAttrs)) {
-            $apiSwagger = $apiSwaggerAttrs[0]->newInstance();
-            if (!$apiSwagger->include) {
-                return; // Skip this class if explicitly excluded
-            }
-        } else {
-            // If ApiSwagger is required for inclusion and class doesn't have it, skip
-            if (Config::get('auto-swagger.scan.require_api_swagger', false)) {
-                return;
-            }
+        $reflectionClass = new ReflectionClass($className);
+        
+        // Check if this controller should be included in the documentation
+        if (!$this->shouldIncludeController($reflectionClass)) {
+            return;
         }
-
-        // Process class level tags
-        $tags = $this->processClassTags($reflectionClass);
-
-        // Process class level security schemes
-        $security = $this->processSecuritySchemes($reflectionClass);
-
-        // Process methods
-        $methods = $reflectionClass->getMethods(\ReflectionMethod::IS_PUBLIC);
-
+        
+        // Get all the tags defined at class level
+        $classTags = $this->processClassTags($reflectionClass);
+        
+        // Get security schemes defined at class level
+        $classSecurity = $this->processSecuritySchemes($reflectionClass);
+        
+        // Process all public methods in the controller
+        $methods = $reflectionClass->getMethods(ReflectionMethod::IS_PUBLIC);
+        
         foreach ($methods as $method) {
-            // Skip methods that are inherited from a parent class
+            // Skip methods inherited from parent classes
             if ($method->class !== $className) {
                 continue;
             }
-
-            // Skip magic methods
-            if (str_starts_with($method->name, '__')) {
-                continue;
-            }
             
-            // Check method level ApiSwagger attribute
-            $methodApiSwaggerAttrs = $method->getAttributes(ApiSwagger::class, ReflectionAttribute::IS_INSTANCEOF);
-            if (!empty($methodApiSwaggerAttrs)) {
-                $methodApiSwagger = $methodApiSwaggerAttrs[0]->newInstance();
-                if (!$methodApiSwagger->include) {
-                    continue; // Skip this method if explicitly excluded
-                }
-            } else {
-                // If ApiSwagger is required for inclusion and method doesn't have it, skip
-                // Also check if class has ApiSwagger - if it does, we still include the method
-                if (Config::get('auto-swagger.scan.require_api_swagger', false) && empty($apiSwaggerAttrs)) {
-                    continue;
-                }
-            }
-
-            $this->processControllerMethod($method, $tags, $security);
+            $this->processControllerMethod($method, $classTags, $classSecurity);
         }
     }
 
+    /**
+     * Determine if a controller should be included in documentation based on ApiSwagger attribute
+     */
+    protected function shouldIncludeController(ReflectionClass $reflectionClass): bool
+    {
+        // Check for ApiSwagger attribute
+        $apiSwaggerAttributes = $reflectionClass->getAttributes(ApiSwagger::class, ReflectionAttribute::IS_INSTANCEOF);
+        
+        // If ApiSwagger is required but not present, skip
+        if (!empty($this->config['attributes']['api_swagger_required']) && 
+            $this->config['attributes']['api_swagger_required'] && 
+            empty($apiSwaggerAttributes)) {
+            return false;
+        }
+        
+        // If ApiSwagger is present but set to not include, skip
+        if (!empty($apiSwaggerAttributes)) {
+            $apiSwagger = $apiSwaggerAttributes[0]->newInstance();
+            if (!$apiSwagger->include) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
     /**
      * Process a controller method to extract endpoint information.
      */
@@ -372,23 +352,32 @@ class SwaggerGenerator
     {
         // Get the method's attributes
         $apiOperationAttributes = $method->getAttributes(ApiOperation::class, ReflectionAttribute::IS_INSTANCEOF);
-
+        
         if (empty($apiOperationAttributes)) {
             return; // Skip methods without ApiOperation attribute
         }
-
+        
+        // Check for ApiSwagger attribute at method level
+        $apiSwaggerAttributes = $method->getAttributes(ApiSwagger::class, ReflectionAttribute::IS_INSTANCEOF);
+        if (!empty($apiSwaggerAttributes)) {
+            $apiSwagger = $apiSwaggerAttributes[0]->newInstance();
+            if (!$apiSwagger->include) {
+                return; // Skip if ApiSwagger->include is false
+            }
+        }
+        
         // Get the first (and typically only) ApiOperation attribute
         $apiOperation = $apiOperationAttributes[0]->newInstance();
-
-        // Use route info if provided, otherwise guess
-        $httpMethod = $routeMethod ?? $this->guessHttpMethod($method->name);
-        $path = $routePath ?? $this->guessPath($method->name, $method->class);
-
+        
+        // Use route info if provided, otherwise use attributes
+        $httpMethod = $routeMethod ?? $apiOperation->method;
+        $path = $routePath ?? $apiOperation->path;
+        
         // If we couldn't determine the method or path, skip this method
         if (!$httpMethod || !$path) {
             return;
         }
-
+        
         // Build operation object
         $operation = [
             'summary' => $apiOperation->summary ?: $method->getName(),
@@ -397,6 +386,19 @@ class SwaggerGenerator
             'responses' => [],
         ];
         
+        // Add security if specified
+        if (!empty($apiOperation->security)) {
+            $operation['security'] = $apiOperation->security;
+        } elseif (!empty($classSecurity)) {
+            $operation['security'] = $classSecurity;
+        }
+        
+        // Add operationId if specified
+        if ($apiOperation->operationId) {
+            $operation['operationId'] = $apiOperation->operationId;
+        }
+        
+        // Mark as deprecated if specified
         if ($apiOperation->deprecated) {
             $operation['deprecated'] = true;
         }
@@ -406,45 +408,38 @@ class SwaggerGenerator
             $operation['parameters'] = $apiOperation->parameters;
         }
         
-        // Look for parameter attributes
+        // Process parameter attributes
         $this->processParameterAttributes($method, $operation);
         
-        // Look for request body attributes
+        // Process request body
         $this->processRequestBodyAttributes($method, $operation);
-        
-        // Auto-detect FormRequest classes from type hints
         $this->processTypeHintedFormRequests($method, $operation);
         
-        // Process responses from attributes
+        // Process response definitions
         $this->processResponseAttributes($method, $operation);
-        
-        // Auto-detect Resources in return statements
         $this->processResourceResponses($method, $operation);
         
-        // Process business exceptions
+        // Process exceptions
         $this->processExceptionAttributes($method, $operation);
-        
-        // If still no responses, add default ones
-        if (empty($operation['responses'])) {
-            // Default responses if none specified
-            $operation['responses'] = [
-                '200' => [
-                    'description' => 'Successful operation',
-                ],
-                '400' => [
-                    'description' => 'Bad request',
-                ],
-                '401' => [
-                    'description' => 'Unauthorized',
-                ],
-                '500' => [
-                    'description' => 'Server error',
-                ],
-            ];
+
+        // If no path is specified, use the one from the ApiOperation attribute or skip
+        if (!$path && !$apiOperation->path) {
+            return;
+        } elseif (!$path) {
+            $path = $apiOperation->path;
         }
         
+        // Add missing path parameters - this ensures all URL path params are documented
+        PathParameterExtractor::addMissingPathParameters($path, $operation);
+        
+        // Determine HTTP method
+        $httpMethod = $routeMethod ? strtoupper($routeMethod) : $apiOperation->method;
+        
         // Add the operation to the path
-        $this->openApiDoc['paths'][$path][$this->httpMethodsMap[$httpMethod]] = $operation;
+        if (!isset($this->openApiDoc['paths'][$path])) {
+            $this->openApiDoc['paths'][$path] = [];
+        }
+        $this->openApiDoc['paths'][$path][$this->httpMethodsMap[Str::upper($httpMethod)]] = $operation;
     }
     
     /**
@@ -627,10 +622,6 @@ class SwaggerGenerator
                 $responseData['content'] = $response->content;
             }
             
-            if (!empty($response->headers)) {
-                $responseData['headers'] = $response->headers;
-            }
-            
             $operation['responses'][(string) $response->statusCode] = $responseData;
         }
     }
@@ -640,58 +631,90 @@ class SwaggerGenerator
      */
     protected function processTypeHintedFormRequests(ReflectionMethod $method, array &$operation): void
     {
-        // Skip if we already have a request body defined
+        // Skip if we already have a request body
         if (isset($operation['requestBody'])) {
             return;
         }
         
-        $params = $method->getParameters();
+        $parameters = $method->getParameters();
         
-        foreach ($params as $param) {
-            $paramType = $param->getType();
+        foreach ($parameters as $parameter) {
+            $type = $parameter->getType();
             
-            // Skip parameters without type hints
-            if ($paramType === null) {
+            if (!$type || $type->isBuiltin() || $type->getName() === 'array') {
                 continue;
             }
             
-            // Get the type name
-            if ($paramType instanceof \ReflectionNamedType) {
-                $typeName = $paramType->getName();
-                
-                // Skip built-in types
-                if ($paramType->isBuiltin()) {
-                    continue;
-                }
-                
-                // Check if this parameter is a FormRequest
-                if (!class_exists($typeName)) {
-                    continue;
-                }
-                
-                if (!is_subclass_of($typeName, FormRequest::class)) {
-                    continue;
-                }
-                
-                // We found a FormRequest, extract schema from it
-                $requestParser = new RequestParser();
-                $schema = $requestParser->parseRequest($typeName);
-                
-                if (!empty($schema)) {
-                    $operation['requestBody'] = [
-                        'description' => 'Request body',
-                        'required' => true,
-                        'content' => [
-                            'application/json' => [
-                                'schema' => $schema
-                            ]
-                        ]
-                    ];
-                    
-                    // Stop after finding the first FormRequest
-                    break;
-                }
+            $typeName = $type->getName();
+            
+            if (!class_exists($typeName)) {
+                continue;
             }
+            
+            $reflectionClass = new ReflectionClass($typeName);
+            
+            // Check if it's a FormRequest
+            if (!$reflectionClass->isSubclassOf(FormRequest::class)) {
+                continue;
+            }
+            
+            // Create a request body from the FormRequest
+            $formRequest = new $typeName();
+            $rules = method_exists($formRequest, 'rules') ? $formRequest->rules() : [];
+            
+            if (empty($rules)) {
+                continue;
+            }
+            
+            $properties = [];
+            $required = [];
+            
+            foreach ($rules as $field => $fieldRules) {
+                $fieldRules = is_array($fieldRules) ? $fieldRules : explode('|', $fieldRules);
+                
+                $property = ['type' => 'string'];
+                
+                // Check for required rule
+                if (in_array('required', $fieldRules)) {
+                    $required[] = $field;
+                }
+                
+                // Infer type from rules
+                if (in_array('numeric', $fieldRules)) {
+                    $property['type'] = 'number';
+                } elseif (in_array('integer', $fieldRules)) {
+                    $property['type'] = 'integer';
+                } elseif (in_array('boolean', $fieldRules)) {
+                    $property['type'] = 'boolean';
+                } elseif (in_array('array', $fieldRules)) {
+                    $property['type'] = 'array';
+                    $property['items'] = ['type' => 'string'];
+                }
+                
+                $properties[$field] = $property;
+            }
+            
+            $schema = [
+                'type' => 'object',
+                'properties' => $properties,
+            ];
+            
+            if (!empty($required)) {
+                $schema['required'] = $required;
+            }
+            
+            $operation['requestBody'] = [
+                'description' => class_basename($typeName),
+                'required' => true,
+                'content' => [
+                    'application/json' => [
+                        'schema' => $schema
+                    ]
+                ]
+            ];
+            
+            // Only process the first FormRequest
+            break;
         }
     }
     
@@ -700,119 +723,70 @@ class SwaggerGenerator
      */
     protected function processResourceResponses(ReflectionMethod $method, array &$operation): void
     {
-        // Skip if we already have responses defined
-        if (!empty($operation['responses']) && isset($operation['responses']['200']['content'])) {
+        // Skip if we already have a 200 response
+        if (isset($operation['responses']['200'])) {
             return;
         }
         
-        // Try to figure out the response type from the return type hint
-        $returnType = $method->getReturnType();
+        $resource = $this->detectResourceInstantiation($method);
         
-        if ($returnType instanceof \ReflectionNamedType) {
-            $typeName = $returnType->getName();
-            
-            // Skip built-in types
-            if ($returnType->isBuiltin() || $typeName === 'void') {
-                return;
-            }
-            
-            // Check if this is a Resource or ResourceCollection
-            if (class_exists($typeName)) {
-                if (is_subclass_of($typeName, JsonResource::class) || is_subclass_of($typeName, ResourceCollection::class)) {
-                    $resourceParser = new ResourceParser();
-                    $schema = $resourceParser->parseResource($typeName);
-                    
-                    if (!empty($schema)) {
-                        if (!isset($operation['responses']['200'])) {
-                            $operation['responses']['200'] = [
-                                'description' => 'Successful operation',
-                            ];
-                        }
-                        
-                        $operation['responses']['200']['content'] = [
-                            'application/json' => [
-                                'schema' => $schema
-                            ]
-                        ];
-                    }
-                }
-            }
+        if (!$resource) {
+            return;
         }
-    }
-
-    /**
-     * Process a controller method's return type for response documentation
-     *
-     * @param  \ReflectionMethod  $method
-     * @return array
-     */
-    protected function processResponseType(ReflectionMethod $method): array
-    {
-        // Check for explicit ApiResponse attributes
-        $responses = $this->processApiResponseAttributes($method);
-        if (!empty($responses)) {
-            return $responses;
-        }
-
-        // Check if we can determine the return type
-        $returnType = $method->getReturnType();
-        if (!$returnType) {
-            return [];
-        }
-
-        $returnTypeName = $returnType->getName();
         
-        // Handle JsonResource type
-        if (is_subclass_of($returnTypeName, JsonResource::class)) {
-            // Try to extract schema from the resource
-            $resourceParser = new ResourceParser();
-            $schema = $resourceParser->parseResource($returnTypeName);
+        $className = $resource['class'];
+        $isCollection = $resource['isCollection'];
+        
+        // Check if this is a JsonResource
+        if (!class_exists($className) || !is_subclass_of($className, JsonResource::class)) {
+            return;
+        }
+        
+        // Get ApiResource attribute
+        $reflectionClass = new ReflectionClass($className);
+        $apiResourceAttributes = $reflectionClass->getAttributes(ApiResource::class, ReflectionAttribute::IS_INSTANCEOF);
+        
+        $schema = [];
+        
+        if (!empty($apiResourceAttributes)) {
+            $apiResource = $apiResourceAttributes[0]->newInstance();
             
-            if (!empty($schema)) {
-                return [
-                    200 => [
-                        'description' => 'Successful response',
-                        'content' => [
-                            'application/json' => [
-                                'schema' => $schema
-                            ]
-                        ]
-                    ]
-                ];
+            if (!empty($apiResource->schema)) {
+                $schema = $apiResource->schema;
             }
         }
-
-        // Check for resource instantiation in method body
-        $resourceInfo = $this->detectResourceInstantiation($method);
-        if ($resourceInfo) {
-            $resourceClass = $resourceInfo['class'];
-            $resourceParser = new ResourceParser();
-            $schema = $resourceParser->parseResource($resourceClass);
-            
-            if (!empty($schema)) {
-                return [
-                    200 => [
-                        'description' => 'Successful response',
-                        'content' => [
-                            'application/json' => [
-                                'schema' => $schema
-                            ]
-                        ]
-                    ]
-                ];
-            }
+        
+        // If no schema is defined, use a default one
+        if (empty($schema)) {
+            $schema = [
+                'type' => 'object',
+                'properties' => [
+                    'data' => [
+                        'type' => 'object',
+                        'properties' => [],
+                    ],
+                ],
+            ];
         }
-
-        // Fall back to a default response
-        return [
-            200 => [
-                'description' => 'Successful response',
-                'content' => [
-                    'application/json' => [
-                        'schema' => [
-                            'type' => 'object'
-                        ]
-                    ]
+        
+        // If it's a collection, wrap in array
+        if ($isCollection || is_subclass_of($className, ResourceCollection::class)) {
+            $schema = [
+                'type' => 'object',
+                'properties' => [
+                    'data' => [
+                        'type' => 'array',
+                        'items' => $schema,
+                    ],
+                ],
+            ];
+        }
+        
+        $operation['responses']['200'] = [
+            'description' => 'Successful response',
+            'content' => [
+                'application/json' => [
+                    'schema' => $schema
                 ]
             ]
         ];
@@ -820,145 +794,61 @@ class SwaggerGenerator
     
     /**
      * Detect resource instantiation in method body
-     * 
-     * @param \ReflectionMethod $method
-     * @return array|null
      */
     protected function detectResourceInstantiation(ReflectionMethod $method): ?array
     {
-        try {
-            // Get method body
-            $fileName = $method->getFileName();
-            $startLine = $method->getStartLine();
-            $endLine = $method->getEndLine();
-            
-            if (!$fileName || !file_exists($fileName)) {
-                return null;
-            }
-            
-            $fileContent = file_get_contents($fileName);
-            $lines = explode("\n", $fileContent);
-            $methodBody = implode("\n", array_slice($lines, $startLine, $endLine - $startLine));
-            
-            // Look for patterns like 'return new SomeResource(' or 'return SomeResource::collection('
-            if (preg_match('/return\s+new\s+([\\\w]+)\s*\(/', $methodBody, $matches)) {
-                $resourceClass = $matches[1];
-                
-                // Resolve the class if it's not fully qualified
-                if (!class_exists($resourceClass)) {
-                    // Try to find the matching import
-                    $namespacePattern = '/namespace\s+([\\\w]+)\s*;/'; 
-                    $importPattern = '/use\s+([\\\w]+\\' . basename($resourceClass) . ')\s*;/'; 
-                    
-                    if (preg_match($namespacePattern, $fileContent, $nsMatches) && 
-                        preg_match($importPattern, $fileContent, $importMatches)) {
-                        $resourceClass = $importMatches[1];
-                    } else {
-                        // Try with namespace
-                        preg_match($namespacePattern, $fileContent, $nsMatches);
-                        $namespace = $nsMatches[1] ?? '';
-                        $possibleClass = $namespace . '\\' . $resourceClass;
-                        
-                        if (class_exists($possibleClass)) {
-                            $resourceClass = $possibleClass;
-                        }
-                    }
-                }
-                
-                if (class_exists($resourceClass) && is_subclass_of($resourceClass, JsonResource::class)) {
-                    return [
-                        'class' => $resourceClass,
-                        'isCollection' => is_subclass_of($resourceClass, ResourceCollection::class)
-                    ];
-                }
-            }
-            
-            // Check for Resource::collection pattern
-            if (preg_match('/return\s+([\\\w]+)::collection\s*\(/', $methodBody, $matches)) {
-                $resourceClass = $matches[1];
-                
-                // Resolve the class if needed (same as above)
-                if (!class_exists($resourceClass)) {
-                    // Try to find the matching import
-                    $namespacePattern = '/namespace\s+([\\\w]+)\s*;/'; 
-                    $importPattern = '/use\s+([\\\w]+\\' . basename($resourceClass) . ')\s*;/'; 
-                    
-                    if (preg_match($namespacePattern, $fileContent, $nsMatches) && 
-                        preg_match($importPattern, $fileContent, $importMatches)) {
-                        $resourceClass = $importMatches[1];
-                    } else {
-                        // Try with namespace
-                        preg_match($namespacePattern, $fileContent, $nsMatches);
-                        $namespace = $nsMatches[1] ?? '';
-                        $possibleClass = $namespace . '\\' . $resourceClass;
-                        
-                        if (class_exists($possibleClass)) {
-                            $resourceClass = $possibleClass;
-                        }
-                    }
-                }
-                
-                if (class_exists($resourceClass) && is_subclass_of($resourceClass, JsonResource::class)) {
-                    return [
-                        'class' => $resourceClass,
-                        'isCollection' => true
-                    ];
-                }
-            }
-        } catch (\Exception $e) {
-            // If anything goes wrong, just return null
+        // This is a simple implementation and might not detect all cases
+        // For a more robust solution, a proper PHP parser should be used
+        
+        if (!$method->getFileName()) {
+            return null;
+        }
+        
+        $file = file_get_contents($method->getFileName());
+        $source = substr($file, $method->getStartLine() - 1, $method->getEndLine() - $method->getStartLine() + 1);
+        
+        // Look for new SomeResource or SomeResource::collection
+        if (preg_match('/new\s+([\\\w]+Resource)\s*\(/i', $source, $matches)) {
+            return [
+                'class' => $matches[1],
+                'isCollection' => false,
+            ];
+        }
+        
+        if (preg_match('/([\\\w]+Resource)::collection\s*\(/i', $source, $matches)) {
+            return [
+                'class' => $matches[1],
+                'isCollection' => true,
+            ];
         }
         
         return null;
     }
-
-    /**
-     * Guess the path based on controller and method name.
-     */
-    protected function guessPath(string $methodName, string $controllerClass): ?string
-    {
-        $controllerBaseName = str_replace('Controller', '', class_basename($controllerClass));
-        $controllerBaseName = Str::kebab($controllerBaseName);
-
-        // Convert method name to kebab case
-        $methodPath = Str::kebab($methodName);
-        
-        // Handle common RESTful methods
-        $methodPath = match ($methodName) {
-            'index' => '',
-            'show' => '/{id}',
-            'store' => '',
-            'update', 'edit' => '/{id}',
-            'destroy' => '/{id}',
-            default => "/{$methodPath}"
-        };
-
-        return "/api/{$controllerBaseName}" . $methodPath;
-    }
     
     /**
-     * Process class level API tags
+     * Process class tags from ApiTag attributes
      */
     protected function processClassTags(ReflectionClass $reflectionClass): array
     {
         $tags = [];
+        
         $apiTagAttributes = $reflectionClass->getAttributes(ApiTag::class, ReflectionAttribute::IS_INSTANCEOF);
         
-        if (!empty($apiTagAttributes)) {
-            foreach ($apiTagAttributes as $tagAttribute) {
-                $apiTag = $tagAttribute->newInstance();
-                $tags[] = $apiTag->name;
+        if (empty($apiTagAttributes)) {
+            // Use controller name as tag if no ApiTag attributes
+            $tags[] = class_basename($reflectionClass->getName());
+            return $tags;
+        }
+        
+        foreach ($apiTagAttributes as $attribute) {
+            $apiTag = $attribute->newInstance();
+            $tags[] = $apiTag->name;
+            
+            // Add tag to OpenAPI doc if it has a description
+            if ($apiTag->description) {
+                $existingTags = array_column($this->openApiDoc['tags'], 'name');
                 
-                // Add tag definition if not exists
-                $tagExists = false;
-                foreach ($this->openApiDoc['tags'] as $tag) {
-                    if ($tag['name'] === $apiTag->name) {
-                        $tagExists = true;
-                        break;
-                    }
-                }
-                
-                if (!$tagExists) {
+                if (!in_array($apiTag->name, $existingTags)) {
                     $this->openApiDoc['tags'][] = [
                         'name' => $apiTag->name,
                         'description' => $apiTag->description,
@@ -967,110 +857,77 @@ class SwaggerGenerator
             }
         }
         
-        // If no tags specified, use controller name as tag
-        if (empty($tags)) {
-            $controllerName = class_basename($reflectionClass->getName());
-            $controllerName = str_replace('Controller', '', $controllerName);
-            $tags[] = $controllerName;
-            
-            // Add tag definition if not exists
-            $tagExists = false;
-            foreach ($this->openApiDoc['tags'] as $tag) {
-                if ($tag['name'] === $controllerName) {
-                    $tagExists = true;
-                    break;
-                }
-            }
-            
-            if (!$tagExists) {
-                $this->openApiDoc['tags'][] = [
-                    'name' => $controllerName,
-                    'description' => $controllerName . ' operations',
-                ];
-            }
-        }
-        
         return $tags;
     }
     
     /**
-     * Process security schemes from a class
+     * Process security schemes from ApiSecurity attributes
      */
     protected function processSecuritySchemes(ReflectionClass $reflectionClass): array
     {
         $security = [];
+        
         $apiSecurityAttributes = $reflectionClass->getAttributes(ApiSecurity::class, ReflectionAttribute::IS_INSTANCEOF);
         
-        if (!empty($apiSecurityAttributes)) {
-            foreach ($apiSecurityAttributes as $securityAttribute) {
-                $apiSecurity = $securityAttribute->newInstance();
-                $security[] = [$apiSecurity->name => $apiSecurity->scopes];
-            }
+        foreach ($apiSecurityAttributes as $attribute) {
+            $apiSecurity = $attribute->newInstance();
+            $security[] = $apiSecurity->security;
         }
         
         return $security;
     }
     
     /**
-     * Analyze Laravel routes to extract API documentation information
+     * Analyze routes for API documentation
      */
     protected function analyzeRoutes(): void
     {
         $routes = Route::getRoutes();
-        $apiPrefix = Config::get('auto-swagger.api_prefix', 'api');
+        $apiPrefix = $this->config['api_prefix'] ?? '';
         
         foreach ($routes as $route) {
-            // Skip routes that don't match the API prefix
+            // Skip routes that shouldn't be included
             if (!$this->shouldIncludeRoute($route, $apiPrefix)) {
                 continue;
             }
             
-            // Get controller and method information
+            // Get the controller and method
             $action = $route->getAction();
             
             if (!isset($action['controller'])) {
-                continue; // Skip routes without controllers (closures, etc.)
-            }
-            
-            // Parse controller action string (Format: \App\Http\Controllers\UserController@show)
-            $segments = explode('@', $action['controller']);
-            
-            if (count($segments) !== 2) {
-                continue; // Invalid controller format
-            }
-            
-            list($controllerClass, $methodName) = $segments;
-            
-            // Skip if controller or method doesn't exist
-            if (!class_exists($controllerClass) || !method_exists($controllerClass, $methodName)) {
                 continue;
             }
             
-            // Get reflection objects
-            $reflectionClass = new ReflectionClass($controllerClass);
-            $reflectionMethod = $reflectionClass->getMethod($methodName);
+            // Parse controller@method format
+            list($controller, $method) = explode('@', $action['controller']);
             
-            // Check ApiSwagger at class level
-            $apiSwaggerAttrs = $reflectionClass->getAttributes(ApiSwagger::class, ReflectionAttribute::IS_INSTANCEOF);
-            $classHasApiSwagger = false;
-            
-            if (!empty($apiSwaggerAttrs)) {
-                $apiSwagger = $apiSwaggerAttrs[0]->newInstance();
-                if (!$apiSwagger->include) {
-                    continue; // Skip if explicitly excluded
-                }
-                $classHasApiSwagger = true;
+            // Check if controller exists
+            if (!class_exists($controller)) {
+                continue;
             }
             
-            // Check ApiSwagger at method level
-            $methodApiSwaggerAttrs = $reflectionMethod->getAttributes(ApiSwagger::class, ReflectionAttribute::IS_INSTANCEOF);
+            $reflectionClass = new ReflectionClass($controller);
             
-            if (!empty($methodApiSwaggerAttrs)) {
-                $methodApiSwagger = $methodApiSwaggerAttrs[0]->newInstance();
-                if (!$methodApiSwagger->include) {
-                    continue; // Skip if explicitly excluded
+            // Check if method exists
+            if (!$reflectionClass->hasMethod($method)) {
+                continue;
+            }
+            
+            $reflectionMethod = $reflectionClass->getMethod($method);
+            
+            // Check if the controller should be included
+            if (!$this->shouldIncludeController($reflectionClass)) {
+                continue;
+            }
+            
+            // Check for ApiSwagger attribute on method
+            $apiSwaggerAttributes = $reflectionMethod->getAttributes(ApiSwagger::class, ReflectionAttribute::IS_INSTANCEOF);
+            if (!empty($apiSwaggerAttributes)) {
+                $apiSwagger = $apiSwaggerAttributes[0]->newInstance();
+                if (!$apiSwagger->include) {
+                    continue; // Skip if ApiSwagger is required but not present
                 }
-            } else if (Config::get('auto-swagger.scan.require_api_swagger', false) && !$classHasApiSwagger) {
+            } elseif (!empty($this->config['attributes']['api_swagger_required']) && $this->config['attributes']['api_swagger_required']) {
                 continue; // Skip if ApiSwagger is required but not present
             }
             
@@ -1140,58 +997,34 @@ class SwaggerGenerator
     }
     
     /**
-     * Extract class name from file path.
+     * Extract path parameters from a route path
+     * 
+     * @param string $path The normalized path
+     * @return array Array of parameter names
      */
-    protected function getClassNameFromFile(string $filePath): ?string
+    protected function extractPathParameters(string $path): array
     {
-        $content = file_get_contents($filePath);
-        $tokens = token_get_all($content);
-        $namespace = '';
-        $className = '';
-        $namespaceFound = false;
-        $classFound = false;
-        
-        foreach ($tokens as $token) {
-            if (is_array($token)) {
-                if ($token[0] === T_NAMESPACE) {
-                    $namespaceFound = true;
-                }
-                
-                if ($namespaceFound && $token[0] === T_STRING) {
-                    $namespace .= '\\' . $token[1];
-                }
-                
-                if ($token[0] === T_CLASS) {
-                    $classFound = true;
-                }
-                
-                if ($classFound && $token[0] === T_STRING) {
-                    $className = $token[1];
-                    break;
-                }
-            } elseif ($namespaceFound && $token === ';') {
-                $namespaceFound = false;
-            }
-        }
-        
-        if (empty($className)) {
-            return null;
-        }
-        
-        return ltrim($namespace, '\\') . '\\' . $className;
+        $matches = [];
+        preg_match_all('/\{([^\}]+)\}/', $path, $matches);
+        return $matches[1] ?? [];
     }
-
+    
     /**
      * Save the generated OpenAPI document to a file.
+     * 
+     * @param string $filePath Path to save the file
+     * @param array|null $openApiDoc Optional custom OpenAPI document (uses internal one if not provided)
+     * @return bool Success or failure
      */
-    public function saveToFile(string $filePath): bool
+    public function saveToFile(string $filePath, ?array $openApiDoc = null): bool
     {
         $directory = dirname($filePath);
+        $docToSave = $openApiDoc ?? $this->openApiDoc;
         
         if (!File::isDirectory($directory)) {
             File::makeDirectory($directory, 0755, true);
         }
         
-        return File::put($filePath, json_encode($this->openApiDoc, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+        return File::put($filePath, json_encode($docToSave, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
     }
 }

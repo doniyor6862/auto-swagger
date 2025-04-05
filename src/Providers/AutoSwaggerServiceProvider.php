@@ -4,6 +4,7 @@ namespace Laravel\AutoSwagger\Providers;
 
 use Illuminate\Support\ServiceProvider;
 use Laravel\AutoSwagger\Console\Commands\GenerateSwaggerCommand;
+use Laravel\AutoSwagger\Services\PathParameterFixer;
 use Laravel\AutoSwagger\Services\SwaggerGenerator;
 
 class AutoSwaggerServiceProvider extends ServiceProvider
@@ -17,8 +18,23 @@ class AutoSwaggerServiceProvider extends ServiceProvider
             __DIR__ . '/../../config/auto-swagger.php', 'auto-swagger'
         );
 
-        $this->app->singleton(SwaggerGenerator::class, function ($app) {
-            return new SwaggerGenerator(config('auto-swagger'));
+        $this->app->bind(SwaggerGenerator::class, function ($app) {
+            $config = config('auto-swagger');
+            return new SwaggerGenerator($config);
+        });
+        
+        // Register the generate:swagger command
+        $this->app->bind('command.auto-swagger.generate', function ($app) {
+            return new GenerateSwaggerCommand($app->make(SwaggerGenerator::class), $app);
+        });
+        
+        // Hook into the swagger generation process to fix path parameters
+        $this->app->resolving(GenerateSwaggerCommand::class, function ($command, $app) {
+            $command->onAfterGenerate(function ($openApiDoc) {
+                // Fix path parameters in the OpenAPI document
+                PathParameterFixer::fixPathParameters($openApiDoc);
+                return $openApiDoc;
+            });
         });
     }
 

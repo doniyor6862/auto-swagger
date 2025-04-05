@@ -8,6 +8,13 @@ use Laravel\AutoSwagger\Services\SwaggerGenerator;
 class GenerateSwaggerCommand extends Command
 {
     /**
+     * Callbacks to run after the OpenAPI document is generated
+     *
+     * @var array
+     */
+    protected array $afterGenerateCallbacks = [];
+    
+    /**
      * The name and signature of the console command.
      *
      * @var string
@@ -24,6 +31,18 @@ class GenerateSwaggerCommand extends Command
     /**
      * Execute the console command.
      */
+    /**
+     * Register a callback to run after the OpenAPI document is generated
+     *
+     * @param callable $callback Function that receives the OpenAPI document and returns the modified document
+     * @return $this
+     */
+    public function onAfterGenerate(callable $callback): self
+    {
+        $this->afterGenerateCallbacks[] = $callback;
+        return $this;
+    }
+    
     public function handle(SwaggerGenerator $generator): int
     {
         $this->info('Generating OpenAPI documentation...');
@@ -32,7 +51,12 @@ class GenerateSwaggerCommand extends Command
         
         $openApiDoc = $generator->generate();
         
-        if ($generator->saveToFile($output)) {
+        // Run all after-generate callbacks
+        foreach ($this->afterGenerateCallbacks as $callback) {
+            $openApiDoc = $callback($openApiDoc);
+        }
+        
+        if ($generator->saveToFile($output, $openApiDoc)) {
             $this->info('OpenAPI documentation generated successfully at: ' . $output);
             return Command::SUCCESS;
         } else {
