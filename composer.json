@@ -1,5 +1,5 @@
 {
-    "name": "laravel/auto-swagger",
+    "name": "doniyor6862/auto-swagger-laravel",
     "description": "Automatically generate OpenAPI/Swagger documentation for Laravel applications using PHP attributes",
     "type": "library",
     "license": "MIT",
