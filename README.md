@@ -57,7 +57,7 @@ Laravel Auto Swagger stands out from other documentation packages because:
 Install the package via Composer:
 
 ```bash
-composer require laravel/auto-swagger
+composer require doniyor6862/auto-swagger-laravel
 ```
 
 Publish the configuration file:
