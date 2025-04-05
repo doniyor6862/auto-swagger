@@ -3,6 +3,8 @@
     "description": "Automatically generate OpenAPI/Swagger documentation for Laravel applications using PHP attributes",
     "type": "library",
     "license": "MIT",
+    "minimum-stability": "dev",
+    "prefer-stable": true,
     "keywords": ["laravel", "swagger", "openapi", "api", "documentation", "attributes"],
     "autoload": {
         "psr-4": {
@@ -15,7 +17,7 @@
             "email": "doniyor.anvarov@bellissimo.uz"
         }
     ],
-    "minimum-stability": "stable",
+
     "require": {
         "php": "^8.0",
         "laravel/framework": "^10.0",
