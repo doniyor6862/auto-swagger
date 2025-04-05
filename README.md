@@ -1,8 +1,9 @@
-# Laravel Auto Swagger
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/swagger-api/swagger-ui/master/docs/images/logo_blue.png" alt="Swagger Logo" width="200">
+  <img src="./public/img.png" alt="Swagger Logo" width="200">
 </p>
+
+# Laravel Auto Swagger
 
 An automatic OpenAPI/Swagger documentation generator for Laravel applications inspired by NestJS's @nestjs/swagger package. This package uses PHP 8 attributes to annotate your controllers and models, while also automatically extracting information from your Laravel Form Requests and API Resources.
 
@@ -21,6 +22,7 @@ An automatic OpenAPI/Swagger documentation generator for Laravel applications in
 - ✅ **Documentation of Eloquent relationships in resources**
 - ✅ **PHPDoc extraction from models (compatible with Laravel IDE Helper)**
 - ✅ **Route analysis and selective documentation with ApiSwagger attribute**
+- ✅ **Business exception documentation with ApiException attribute**
 - ✅ Intelligent schema inference from models and type hints
 
 ### Documentation Features
@@ -514,6 +516,40 @@ You can also enable route analysis to automatically document all of your routes:
 
 Learn more in the [ApiSwagger Documentation](docs/API_SWAGGER.md).
 
+### Business Exception Documentation
+
+You can document business exceptions thrown by your API endpoints:
+
+```php
+use App\Exceptions\ProductNotFoundException;
+use Laravel\AutoSwagger\Attributes\ApiException;
+
+class ProductController extends Controller
+{
+    #[ApiOperation(summary: 'Get product details')]
+    #[ApiException(
+        exception: ProductNotFoundException::class,
+        statusCode: 404,
+        description: 'The requested product does not exist'
+    )]
+    public function show($id)
+    {
+        // Method implementation that might throw ProductNotFoundException
+    }
+    
+    // Document multiple exceptions for a single endpoint
+    #[ApiOperation(summary: 'Add product to cart')]
+    #[ApiException(exception: ProductNotFoundException::class, statusCode: 404)]
+    #[ApiException(exception: InsufficientStockException::class, statusCode: 422)]
+    public function addToCart($id, Request $request)
+    {
+        // Method implementation
+    }
+}
+```
+
+Learning more in the [Business Exceptions Documentation](docs/EXCEPTIONS.md).
+
 ## Generating Documentation
 
 Run the Artisan command to generate your documentation:
@@ -538,6 +574,7 @@ Detailed documentation is available in the `/docs` directory:
 - [API Resource Documentation](docs/API_RESOURCE.md) - How to customize API Resources
 - [Relationships Documentation](docs/RELATIONSHIPS.md) - How to document model relationships
 - [ApiSwagger Documentation](docs/API_SWAGGER.md) - How to selectively document API endpoints
+- [Business Exceptions Documentation](docs/EXCEPTIONS.md) - How to document business exceptions
 - [Attribute Reference](docs/ATTRIBUTES.md) - All available PHP 8 attributes
 - [Example Implementation](EXAMPLE.md) - Complete blog API example
 - [Usage Guide](USAGE_GUIDE.md) - Detailed usage instructions
@@ -574,6 +611,17 @@ Used to mark controllers or methods for inclusion in the Swagger documentation.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | include | bool | true | Whether to include this controller/method in the documentation |
+
+#### ApiException
+
+Used to document business exceptions that can be thrown by an API endpoint.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| exception | string | required | The fully qualified exception class name |
+| statusCode | int | 422 | The HTTP status code returned when this exception occurs |
+| description | string | '' | Human-readable description of when this exception occurs |
+| schema | array | [] | Custom schema for the error response (optional) |
 
 ### ApiProperty
 

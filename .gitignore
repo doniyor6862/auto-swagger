@@ -1,0 +1,52 @@
+# Composer
+/vendor/
+composer.lock
+
+# PHP CS Fixer
+.php-cs-fixer.cache
+.php_cs.cache
+
+# PHPUnit
+.phpunit.result.cache
+phpunit.xml
+
+# PHPStan
+phpstan.neon
+
+# Package specific
+/public/swagger/
+/public/swagger/swagger.json
+
+# Node.js
+/node_modules/
+/npm-debug.log
+/yarn-error.log
+/yarn.lock
+/package-lock.json
+
+# IDEs & Editors
+/.idea/
+/.vscode/
+*.sublime-project
+*.sublime-workspace
+/.phpintel/
+*.code-workspace
+
+# OS Files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Environment
+.env
+.env.backup
+.env.testing
+
+# Cache & logs
+/storage/
+/bootstrap/cache/
+*.log
+
+# Build Files
+/build/
+/dist/
