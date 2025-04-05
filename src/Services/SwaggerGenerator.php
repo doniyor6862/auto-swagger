@@ -1010,6 +1010,55 @@ class SwaggerGenerator
     }
     
     /**
+     * Extract class name from file path.
+     * 
+     * @param string $filePath Absolute path to the PHP file
+     * @return string|null Fully qualified class name or null if not found
+     */
+    protected function getClassNameFromFile(string $filePath): ?string
+    {
+        if (!file_exists($filePath)) {
+            return null;
+        }
+        
+        $content = file_get_contents($filePath);
+        $tokens = token_get_all($content);
+        $namespace = '';
+        $className = '';
+        $namespaceFound = false;
+        $classFound = false;
+        
+        foreach ($tokens as $token) {
+            if (is_array($token)) {
+                if ($token[0] === T_NAMESPACE) {
+                    $namespaceFound = true;
+                }
+                
+                if ($namespaceFound && $token[0] === T_STRING) {
+                    $namespace .= '\\' . $token[1];
+                }
+                
+                if ($token[0] === T_CLASS) {
+                    $classFound = true;
+                }
+                
+                if ($classFound && $token[0] === T_STRING) {
+                    $className = $token[1];
+                    break;
+                }
+            } elseif ($namespaceFound && $token === ';') {
+                $namespaceFound = false;
+            }
+        }
+        
+        if (empty($className)) {
+            return null;
+        }
+        
+        return ltrim($namespace, '\\') . '\\' . $className;
+    }
+    
+    /**
      * Save the generated OpenAPI document to a file.
      * 
      * @param string $filePath Path to save the file
