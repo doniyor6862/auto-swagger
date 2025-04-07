@@ -206,11 +206,15 @@ class ResourceParser
         }
         
         try {
-            // Create an instance of the model
-            $model = new $modelClass();
             $reflectionClass = new ReflectionClass($modelClass);
             
-            // Get all public methods
+            // First, check for Laravel IDE Helper DocBlocks at the class level
+            $classDocComment = $reflectionClass->getDocComment();
+            if ($classDocComment) {
+                $this->parseIdeHelperDocBlockRelations($properties, $classDocComment);
+            }
+            
+            // Then also process method-based relations for completeness
             $methods = $reflectionClass->getMethods(ReflectionMethod::IS_PUBLIC);
             
             foreach ($methods as $method) {
@@ -221,67 +225,197 @@ class ResourceParser
                 
                 $methodName = $method->getName();
                 
-                // Try to detect if this is a relation method
-                // We're looking for methods that return relationship objects
+                // Skip common methods that are not likely to be relations
+                $nonRelationMethods = ['toArray', 'jsonSerialize', 'getAttribute', 'setAttribute', 'save', 'delete', 'update', 'fill'];
+                if (in_array($methodName, $nonRelationMethods) || str_starts_with($methodName, 'get') || str_starts_with($methodName, 'set')) {
+                    continue;
+                }
+                
+                // Checking return type for relation
+                $isRelation = false;
+                $isToMany = false;
+                $relatedModel = null;
+                
+                // First, check return type if available
                 $returnType = $method->getReturnType();
                 if ($returnType) {
-                    $returnTypeName = $returnType->getName();
+                    if ($returnType instanceof \ReflectionNamedType) {
+                        $returnTypeName = $returnType->getName();
+                        
+                        // Check if the return type is a relation class
+                        $relationClasses = [
+                            'Illuminate\\Database\\Eloquent\\Relations\\HasOne' => false,
+                            'Illuminate\\Database\\Eloquent\\Relations\\HasMany' => true,
+                            'Illuminate\\Database\\Eloquent\\Relations\\BelongsTo' => false,
+                            'Illuminate\\Database\\Eloquent\\Relations\\BelongsToMany' => true,
+                            'Illuminate\\Database\\Eloquent\\Relations\\MorphTo' => false,
+                            'Illuminate\\Database\\Eloquent\\Relations\\MorphOne' => false,
+                            'Illuminate\\Database\\Eloquent\\Relations\\MorphMany' => true,
+                            'Illuminate\\Database\\Eloquent\\Relations\\MorphToMany' => true,
+                            'Illuminate\\Database\\Eloquent\\Relations\\HasOneThrough' => false,
+                            'Illuminate\\Database\\Eloquent\\Relations\\HasManyThrough' => true,
+                        ];
+                        
+                        foreach ($relationClasses as $relationClass => $toMany) {
+                            if (is_a($returnTypeName, $relationClass, true)) {
+                                $isRelation = true;
+                                $isToMany = $toMany;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // If no return type, try to detect from method body or conventions
+                if (!$isRelation) {
+                    // Common naming patterns for Eloquent relations
+                    if (preg_match('/^(has[A-Z]|belongs[A-Z]|morph[A-Z])/', $methodName)) {
+                        $isRelation = true;
+                        // Check if it's likely a to-many relation
+                        $isToMany = (bool)preg_match('/^(hasMany|belongsToMany|morphMany|morphToMany|hasManyThrough)/', $methodName);
+                    }
+                }
+                
+                if ($isRelation) {
+                    // Try to guess the related model from method PHPDoc
+                    $docComment = $method->getDocComment();
+                    $modelInfo = $this->extractModelFromDocComment($docComment);
+                    $relatedModel = $modelInfo['model'];
                     
-                    // Check if the return type is a relation class
-                    $relationClasses = [
-                        'Illuminate\Database\Eloquent\Relations\HasOne',
-                        'Illuminate\Database\Eloquent\Relations\HasMany',
-                        'Illuminate\Database\Eloquent\Relations\BelongsTo',
-                        'Illuminate\Database\Eloquent\Relations\BelongsToMany',
-                        'Illuminate\Database\Eloquent\Relations\MorphTo',
-                        'Illuminate\Database\Eloquent\Relations\MorphOne',
-                        'Illuminate\Database\Eloquent\Relations\MorphMany',
-                        'Illuminate\Database\Eloquent\Relations\MorphToMany',
-                        'Illuminate\Database\Eloquent\Relations\HasOneThrough',
-                        'Illuminate\Database\Eloquent\Relations\HasManyThrough',
-                    ];
+                    // If isCollection is set from PHPDoc, use that instead of the type inference
+                    if ($modelInfo['model'] && $modelInfo['isCollection']) {
+                        $isToMany = true;
+                    }
                     
-                    $isRelation = false;
-                    foreach ($relationClasses as $relationClass) {
-                        if (is_a($returnTypeName, $relationClass, true)) {
-                            $isRelation = true;
-                            break;
+                    // If no model from PHPDoc, try to guess from method name
+                    if (!$relatedModel) {
+                        // Extract model name from method name (e.g., hasMany('App\Models\Comment') -> Comment)
+                        $cleanMethodName = preg_replace('/^(has|belongs|morph)(One|Many|To|ToMany|OneThrough|ManyThrough)/', '', $methodName);
+                        if ($cleanMethodName !== $methodName) { // If we actually cleaned something
+                            // Convert to singular if it's not already
+                            if (str_ends_with($cleanMethodName, 's')) {
+                                $cleanMethodName = substr($cleanMethodName, 0, -1);
+                            }
+                            
+                            // Try to find the class
+                            $possibleNamespaces = [
+                                'App\\Models\\',
+                                'App\\',
+                                ''
+                            ];
+                            
+                            foreach ($possibleNamespaces as $namespace) {
+                                $possibleClass = $namespace . $cleanMethodName;
+                                if (class_exists($possibleClass)) {
+                                    $relatedModel = $possibleClass;
+                                    break;
+                                }
+                            }
                         }
                     }
                     
-                    if ($isRelation) {
-                        // This method returns a relation
-                        $isToMany = $this->isToManyRelation($returnTypeName);
+                    // Add relation to schema if not already added by IDE Helper
+                    if ($relatedModel && class_exists($relatedModel) && !isset($properties[$methodName])) {
+                        $relationSchema = $this->buildSchemaFromModel($relatedModel, false);
                         
-                        // Try to guess the related model from PHPDoc
-                        $docComment = $method->getDocComment();
-                        $relatedModel = $this->extractModelFromDocComment($docComment);
-                        
-                        if ($relatedModel && class_exists($relatedModel)) {
-                            $relationSchema = $this->buildSchemaFromModel($relatedModel, false);
-                            
-                            if ($isToMany) {
-                                $properties[$methodName] = [
-                                    'type' => 'array',
-                                    'items' => $relationSchema
-                                ];
-                            } else {
-                                $properties[$methodName] = $relationSchema;
-                            }
+                        if ($isToMany) {
+                            $properties[$methodName] = [
+                                'type' => 'array',
+                                'items' => $relationSchema
+                            ];
                         } else {
-                            // If we couldn't determine the model, add a generic schema
-                            if ($isToMany) {
-                                $properties[$methodName] = [
-                                    'type' => 'array',
-                                    'items' => [
-                                        'type' => 'object'
+                            $properties[$methodName] = $relationSchema;
+                        }
+                    } else if ($isRelation && !isset($properties[$methodName])) {
+                        // If we couldn't determine the model, add a generic schema
+                        if ($isToMany) {
+                            $properties[$methodName] = [
+                                'type' => 'array',
+                                'items' => [
+                                    'type' => 'object',
+                                    'properties' => [
+                                        'id' => ['type' => 'integer'],
+                                        'created_at' => ['type' => 'string', 'format' => 'date-time'],
+                                        'updated_at' => ['type' => 'string', 'format' => 'date-time']
                                     ]
-                                ];
-                            } else {
-                                $properties[$methodName] = [
-                                    'type' => 'object'
-                                ];
-                            }
+                                ]
+                            ];
+                        } else {
+                            $properties[$methodName] = [
+                                'type' => 'object',
+                                'properties' => [
+                                    'id' => ['type' => 'integer'],
+                                    'created_at' => ['type' => 'string', 'format' => 'date-time'],
+                                    'updated_at' => ['type' => 'string', 'format' => 'date-time']
+                                ]
+                            ];
+                        }
+                    }
+                }
+            }
+        } catch (\Exception $e) {
+            // If anything goes wrong, just continue
+        }
+    }
+    
+    /**
+     * Parse Laravel IDE Helper DocBlocks from class comments to extract relationships
+     */
+    protected function parseIdeHelperDocBlockRelations(array &$properties, string $classDocComment): void
+    {
+        // Match all @property-read annotations for collections
+        preg_match_all('/@property(?:-read|-write)?\s+\\?Illuminate\\Database\\Eloquent\\Collection\s*<\s*([\\\w]+)\s*>\s+\$(\w+)/', $classDocComment, $collectionMatches, PREG_SET_ORDER);
+        
+        foreach ($collectionMatches as $match) {
+            $relatedModel = $match[1];
+            $propertyName = $match[2];
+            
+            if (class_exists($relatedModel)) {
+                $relationSchema = $this->buildSchemaFromModel($relatedModel, false);
+                
+                $properties[$propertyName] = [
+                    'type' => 'array',
+                    'items' => $relationSchema
+                ];
+            }
+        }
+        
+        // Match all @property-read annotations for single models
+        preg_match_all('/@property(?:-read|-write)?\s+([\\\w]+)(?:\|null)?\s+\$(\w+)/', $classDocComment, $modelMatches, PREG_SET_ORDER);
+        
+        foreach ($modelMatches as $match) {
+            $relatedModel = $match[1];
+            $propertyName = $match[2];
+            
+            // Skip any that are not model classes or are collections (already handled)
+            if (class_exists($relatedModel) && 
+                !is_a($relatedModel, 'Illuminate\\Database\\Eloquent\\Collection', true) &&
+                !isset($properties[$propertyName]) &&
+                !preg_match('/^(int|string|bool|array|object|mixed|void|Carbon|DateTime|\\?Illuminate\\)/', $relatedModel)) {
+                
+                $relationSchema = $this->buildSchemaFromModel($relatedModel, false);
+                $properties[$propertyName] = $relationSchema;
+            }
+        }
+    }
+                                'items' => [
+                                    'type' => 'object',
+                                    'properties' => [
+                                        'id' => ['type' => 'integer'],
+                                        'created_at' => ['type' => 'string', 'format' => 'date-time'],
+                                        'updated_at' => ['type' => 'string', 'format' => 'date-time']
+                                    ]
+                                ]
+                            ];
+                        } else {
+                            $properties[$methodName] = [
+                                'type' => 'object',
+                                'properties' => [
+                                    'id' => ['type' => 'integer'],
+                                    'created_at' => ['type' => 'string', 'format' => 'date-time'],
+                                    'updated_at' => ['type' => 'string', 'format' => 'date-time']
+                                ]
+                            ];
                         }
                     }
                 }
