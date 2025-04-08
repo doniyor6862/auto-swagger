@@ -35,8 +35,9 @@ return [
     |--------------------------------------------------------------------------
     */
     'scan' => [
-        'controllers_path' => app_path('Http/Controllers'),
-        'models_path' => app_path('Models'),
+        'models_path' => [
+            'App\\Models\\',
+        ],
         'include_patterns' => [
             app_path('Http/Controllers/*.php'),
             app_path('Http/Controllers/**/*.php'),

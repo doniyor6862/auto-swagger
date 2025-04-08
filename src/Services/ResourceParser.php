@@ -2,12 +2,8 @@
 
 namespace Laravel\AutoSwagger\Services;
 
-use Illuminate\Http\Resources\Json\JsonResource;
-use Illuminate\Http\Resources\Json\ResourceCollection;
-use Laravel\AutoSwagger\Attributes\ApiResource;
 use ReflectionAttribute;
 use ReflectionClass;
-use ReflectionMethod;
 use ReflectionProperty;
 
 class ResourceParser
@@ -15,32 +11,30 @@ class ResourceParser
     /**
      * Extract schema information from a Laravel API Resource
      */
-    public function parseResource(string $resourceClass): array
+    public function parseResource(ReflectionAttribute $reflectionAttribute): array
     {
-        if (!class_exists($resourceClass)) {
-            return [];
-        }
 
-        // Check if the class extends JsonResource or ResourceCollection
-        if (!is_subclass_of($resourceClass, JsonResource::class) && !is_subclass_of($resourceClass, ResourceCollection::class)) {
-            return [];
-        }
+        $response = $reflectionAttribute->getArguments()['model'];
 
-        // Get the reflection class
-        $reflectionClass = new ReflectionClass($resourceClass);
-
-        // Check for ApiResource attribute first
-        $apiResourceAttributes = $reflectionClass->getAttributes(ApiResource::class, ReflectionAttribute::IS_INSTANCEOF);
-
-        if (!empty($apiResourceAttributes)) {
-            $apiResource = $apiResourceAttributes[0]->newInstance();
-            $data = $this->detectAndAddAllRelations($apiResource->model);
+        if (class_exists($response)) {
+            $data = $this->detectAndAddAllRelations($response);
             return [
                 "type" => "object",
                 "properties" => $data
             ];
         }
-        return [];
+
+        if (is_array($response)) {
+            return [
+                "type" => "object",
+                "properties" => $response
+            ];
+        }
+
+        return [
+            "type" => "object",
+            "properties" => []
+        ];
     }
 
 
@@ -55,7 +49,6 @@ class ResourceParser
 
         try {
             // Create an instance of the model
-            $model = new $modelClass();
             $reflectionClass = new ReflectionClass($modelClass);
             $docComment = $reflectionClass->getDocComment();
 
@@ -82,47 +75,61 @@ class ResourceParser
             // Process properties from docblock
             foreach ($docProperties as $property) {
                 preg_match('/@property(-read)?\s+([\w\\\\|]+)\s+\$(\w+)/', $property, $matches);
-                if ($matches) {
-                    $propName = $matches[3];
-                    $propType = $matches[2];
-                    $isReadOnly = !empty($matches[1]); // Determine if it's a read-only property
+                preg_match('/@property-(read)\s+Collection<([^,]+),\s*([^>]+)>\s+\$(\w+)/', $property, $collectionMatches);
 
-                    $phpDocType[] = [
-                        'name' => $propName,
-                        'type' => $propType,
-                        'readonly' => !empty($matches[1])
-                    ];
+                if ($matches || $collectionMatches) {
 
-                    // Add property to schema based on its type
-                    if (str_contains($propType, 'Collection') || str_contains($propType, '[]')) {
-                        // This is a collection/array property
-                        // Try to extract the model type from collection
-                        $modelType = null;
-                        if (preg_match('/Collection<([\w\\\\]+)>/', $propType, $typeMatches)) {
-                            $modelType = $typeMatches[1];
-                        } elseif (preg_match('/([\w\\\\]+)\[\]/', $propType, $typeMatches)) {
-                            $modelType = $typeMatches[1];
-                        }
+                    $isColection = false;
+                    if ($matches) {
+                        $propName = $matches[3];
+                        $propType = $matches[2];
+                        $isReadOnly = false; // Determine if it's a read-only property
 
-                        if ($modelType && class_exists($modelType)) {
-                            $itemSchema = $this->buildSchemaFromModel($modelType, false);
-                            $properties[$propName] = [
-                                'type' => 'array',
-                                'items' => $itemSchema
-                            ];
-                        } else {
-                            $properties[$propName] = [
-                                'type' => 'array',
-                                'items' => ['type' => 'object']
-                            ];
-                        }
-                    } elseif (strpos($propType, '\\') !== false) {
+                        $phpDocType[] = [
+                            'name' => $propName,
+                            'type' => $propType,
+                            'readonly' => $isReadOnly
+                        ];
+
+                    } else {
+                        $propName = $collectionMatches[4];
+                        $propType = $collectionMatches[3];
+                        $isReadOnly = false;
+                        $isColection = true;
+
+                        $phpDocType[] = [
+                            'name' => $collectionMatches[4],
+                            'type' => $collectionMatches[3],
+                            'readonly' => false
+                        ];
+                    }
+
+                    try {
+                        $model = new ReflectionClass('App\\Models\\' . $propType);
+                        $isModel = true;
+                    } catch (\Throwable $exception) {
+                        $isModel = false;
+                        $model = null;
+                    }
+
+
+                    if ((strpos($propType, '\\') !== false || $isModel) && $isColection === false) {
                         // This looks like a class name
-                        if (class_exists($propType)) {
-                            $properties[$propName] = $this->buildSchemaFromModel($propType, false);
+                        if ($model) {
+                            $properties[$propName] = $this->buildSchemaFromModel('App\\Models\\' . $propType, false);
                         } else {
                             $properties[$propName] = ['type' => 'object'];
                         }
+                    } elseif ($isColection === true) {
+                        $data = $this->detectAndAddAllRelations('App\\Models\\' . $propType);
+
+                        $properties[$propName] = [
+                            "type" => "array",
+                            "items" => [
+                                "type" => "object",
+                                "properties" => $data
+                            ]
+                        ];
                     } else {
                         // Convert PHP types to JSON Schema types
                         $schemaType = 'string';
@@ -168,11 +175,10 @@ class ResourceParser
 
             return $properties;
         } catch (\Exception $e) {
-            echo $e->getMessage();
+            // If anything goes wrong, just continue
             return [];
         }
     }
-
 
 
     /**
@@ -294,11 +300,10 @@ class ResourceParser
     }
 
 
-
     /**
      * Wrap a schema in a paginated collection format
      */
-    protected function wrapInPaginatedCollection(array $schema): array
+    public function wrapInPaginatedCollection(array $schema): array
     {
         return [
             'type' => 'object',

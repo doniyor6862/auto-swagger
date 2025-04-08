@@ -108,45 +108,8 @@ class SwaggerGenerator
      */
     public function generate(): array
     {
-        $this->scanModels();
-        $this->scanControllers($this->config['scan']['controllers_path']);
+        $this->scanRoutes();
         return $this->openApiDoc;
-    }
-
-    /**
-     * Scan model classes for API schema definitions.
-     */
-    protected function scanModels(): void
-    {
-        // Check if models path exists
-        if (!file_exists($this->config['scan']['models_path'])) {
-            return;
-        }
-
-        $modelFinder = new Finder();
-        $modelFinder->files()->in($this->config['scan']['models_path'])->name('*.php');
-
-        foreach ($modelFinder as $file) {
-            $className = $this->getClassNameFromFile($file->getRealPath());
-
-            if (!$className) {
-                continue;
-            }
-
-            // If PHPDoc scanning is enabled in config
-            if (isset($this->config['scan']['use_phpdoc']) && $this->config['scan']['use_phpdoc']) {
-                // Process models with ApiModel attributes first, then try PHPDoc for all models
-                $this->processModelClass($className);
-            } else {
-                // Only process models that have explicit ApiModel attributes
-                $reflectionClass = new ReflectionClass($className);
-                $apiModelAttributes = $reflectionClass->getAttributes(ApiModel::class, ReflectionAttribute::IS_INSTANCEOF);
-
-                if (!empty($apiModelAttributes)) {
-                    $this->processModelClass($className);
-                }
-            }
-        }
     }
 
     /**
@@ -266,34 +229,9 @@ class SwaggerGenerator
     /**
      * Scan controller classes for API endpoint definitions.
      */
-    protected function scanControllers(string $path): void
+    protected function scanRoutes(): void
     {
-        // First approach: Scan controller files
-        $finder = new Finder();
-        $finder->files()->name('*.php')->in($path);
-
-        // Add include patterns if they exist in config
-        if ($includePatterns = Config::get('auto-swagger.scan.include_patterns', [])) {
-            $finder->path($includePatterns);
-        }
-
-        // Add exclude patterns if they exist in config
-        if ($excludePatterns = Config::get('auto-swagger.scan.exclude_patterns', [])) {
-            $finder->notPath($excludePatterns);
-        }
-
-        foreach ($finder as $file) {
-            $className = $this->getClassNameFromFile($file->getRealPath());
-
-            if ($className) {
-                $this->processControllerClass($className);
-            }
-        }
-
-        // Second approach: Analyze routes (if enabled)
-        if (Config::get('auto-swagger.scan.analyze_routes', false)) {
-            $this->analyzeRoutes();
-        }
+        $this->analyzeRoutes();
     }
 
     /**
@@ -462,7 +400,7 @@ class SwaggerGenerator
 
         foreach ($exceptions as $exceptionAttribute) {
             $apiException = $exceptionAttribute->newInstance();
-            $statusCode = (string) $apiException->statusCode;
+            $statusCode = (string)$apiException->statusCode;
 
             // Skip if we already have a response for this status code from ApiResponse
             if (isset($operation['responses'][$statusCode])) {
@@ -567,26 +505,128 @@ class SwaggerGenerator
             return;
         }
 
-        $requestBody = $requestBodyAttributes[0]->newInstance();
+        $request = null;
 
-        $requestBodyData = [
-            'description' => $requestBody->description,
-            'required' => $requestBody->required,
-        ];
+        array_map(function (\ReflectionParameter $parameter) use (&$request) {
+            if ($parameter->name === 'request') {
+                $request = $parameter->getType();
+            }
+        }, $method->getParameters());
 
-        if ($requestBody->ref) {
-            $requestBodyData['content'] = [
-                'application/json' => [
-                    'schema' => [
-                        '$ref' => $requestBody->ref
-                    ]
-                ]
-            ];
-        } elseif (!empty($requestBody->content)) {
-            $requestBodyData['content'] = $requestBody->content;
+        $requestClass = new ReflectionClass($request->getName());
+
+        if (!$requestClass->isSubclassOf(FormRequest::class)) {
+            $requestBody = [];
+        } else {
+            $rules = $requestClass->newInstance()->rules();
+
+            $requestBody = $this->buildRequestSchema($request->getName(), $rules);
         }
 
+        $requestBodyData['content'] = [
+            'application/json' => [
+                'schema' => $requestBody
+            ]
+        ];
+
         $operation['requestBody'] = $requestBodyData;
+
+//        $operation['requestBody'] = $requestBody;
+//        $requestBody = $requestBodyAttributes[0]->newInstance();
+//
+//        $requestBodyData = [
+//            'description' => $requestBody->description,
+//            'required' => $requestBody->required,
+//        ];
+//
+//        if ($requestBody->ref) {
+//            $requestBodyData['content'] = [
+//                'application/json' => [
+//                    'schema' => [
+//                        '$ref' => $requestBody->ref
+//                    ]
+//                ]
+//            ];
+//        } elseif (!empty($requestBody->content)) {
+//            $requestBodyData['content'] = $requestBody->content;
+//        }
+//
+//        $operation['requestBody'] = $requestBodyData;
+    }
+
+
+    private function buildRequestSchema(string $requestName, array $rules): array
+    {
+        $requestName = last(explode('\\', $requestName));
+        $schema = [
+            'type' => 'object',
+            'properties' => []
+        ];
+
+        $required = [];
+
+        foreach ($rules as $field => $fieldRules) {
+            // Handle dot notation for nested properties
+            if (strpos($field, '.') !== false) {
+                // For simplicity, we'll skip nested properties in this example
+                continue;
+            }
+
+            // Convert to array if it's a string
+            if (is_string($fieldRules)) {
+                $fieldRules = explode('|', $fieldRules);
+            }
+
+            $property = [
+                'type' => 'string' // Default type
+            ];
+
+            // Check if field is required
+            if (in_array('required', $fieldRules)) {
+                $required[] = $field;
+            }
+
+            // Determine type from rules
+            foreach ($fieldRules as $rule) {
+                $rule = is_string($rule) ? $rule : '';
+
+                if (strpos($rule, 'integer') === 0 || strpos($rule, 'numeric') === 0) {
+                    $property['type'] = 'integer';
+                } elseif (strpos($rule, 'boolean') === 0) {
+                    $property['type'] = 'boolean';
+                } elseif (strpos($rule, 'array') === 0) {
+                    $property['type'] = 'array';
+                    $property['items'] = ['type' => 'string'];
+                } elseif (strpos($rule, 'date') === 0) {
+                    $property['type'] = 'string';
+                    $property['format'] = 'date-time';
+                } elseif (strpos($rule, 'email') === 0) {
+                    $property['format'] = 'email';
+                } elseif (preg_match('/max:(\d+)/', $rule, $matches)) {
+                    if ($property['type'] === 'string') {
+                        $property['maxLength'] = (int)$matches[1];
+                    } else {
+                        $property['maximum'] = (int)$matches[1];
+                    }
+                } elseif (preg_match('/min:(\d+)/', $rule, $matches)) {
+                    if ($property['type'] === 'string') {
+                        $property['minLength'] = (int)$matches[1];
+                    } else {
+                        $property['minimum'] = (int)$matches[1];
+                    }
+                } elseif (preg_match('/in:(.+)/', $rule, $matches)) {
+                    $property['enum'] = explode(',', $matches[1]);
+                }
+            }
+
+            $schema['properties'][$field] = $property;
+        }
+
+        if (!empty($required)) {
+            $schema['required'] = $required;
+        }
+
+        return $schema;
     }
 
     /**
@@ -631,7 +671,7 @@ class SwaggerGenerator
                 $responseData['headers'] = $response->headers;
             }
 
-            $operation['responses'][(string) $response->statusCode] = $responseData;
+            $operation['responses'][(string)$response->statusCode] = $responseData;
         }
     }
 
@@ -704,118 +744,34 @@ class SwaggerGenerator
         if (!empty($operation['responses']) && isset($operation['responses']['200']['content'])) {
             return;
         }
-
-        // Try to figure out the response type from the return type hint
-        $returnType = $method->getReturnType();
-
-        if ($returnType instanceof \ReflectionNamedType) {
-            $typeName = $returnType->getName();
-
-            // Skip built-in types
-            if ($returnType->isBuiltin() || $typeName === 'void') {
-                return;
-            }
-
-            // Check if this is a Resource or ResourceCollection
-            if (class_exists($typeName)) {
-                if (is_subclass_of($typeName, JsonResource::class) || is_subclass_of($typeName, ResourceCollection::class)) {
-                    $resourceParser = new ResourceParser();
-                    $schema = $resourceParser->parseResource($typeName);
-
-                    if (!empty($schema)) {
-                        if (!isset($operation['responses']['200'])) {
-                            $operation['responses']['200'] = [
-                                'description' => 'Successful operation',
-                            ];
-                        }
-
-                        $operation['responses']['200']['content'] = [
-                            'application/json' => [
-                                'schema' => $schema
-                            ]
-                        ];
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Process a controller method's return type for response documentation
-     *
-     * @param  \ReflectionMethod  $method
-     * @return array
-     */
-    protected function processResponseType(ReflectionMethod $method): array
-    {
-        // Check for explicit ApiResponse attributes
-        $responses = $this->processApiResponseAttributes($method);
-        if (!empty($responses)) {
-            return $responses;
-        }
-
-        // Check if we can determine the return type
-        $returnType = $method->getReturnType();
-        if (!$returnType) {
-            return [];
-        }
-
-        $returnTypeName = $returnType->getName();
-
-        // Handle JsonResource type
-        if (is_subclass_of($returnTypeName, JsonResource::class)) {
-            // Try to extract schema from the resource
+        if (empty($method->getAttributes(ApiResource::class))) {
+            $schema = [
+                "type" => "object",
+                "properties" => []
+            ];
+        } else {
+            $responseAttribute = $method->getAttributes(ApiResource::class)[0];
             $resourceParser = new ResourceParser();
-            $schema = $resourceParser->parseResource($returnTypeName);
+            $schema = $resourceParser->parseResource($responseAttribute);
+            if (isset($responseAttribute->getArguments()['isPaginated']) && $responseAttribute->getArguments()['isPaginated']) {
+                $schema = $resourceParser->wrapInPaginatedCollection($schema);
+            }
+        }
 
-            if (!empty($schema)) {
-                return [
-                    200 => [
-                        'description' => 'Successful response',
-                        'content' => [
-                            'application/json' => [
-                                'schema' => $schema
-                            ]
-                        ]
-                    ]
+        if (!empty($schema)) {
+            if (!isset($operation['responses']['200'])) {
+                $operation['responses']['200'] = [
+                    'description' => 'Successful operation',
                 ];
             }
-        }
 
-        // Check for resource instantiation in method body
-        $resourceInfo = $this->detectResourceInstantiation($method);
-        if ($resourceInfo) {
-            $resourceClass = $resourceInfo['class'];
-            $resourceParser = new ResourceParser();
-            $schema = $resourceParser->parseResource($resourceClass);
-
-            if (!empty($schema)) {
-                return [
-                    200 => [
-                        'description' => 'Successful response',
-                        'content' => [
-                            'application/json' => [
-                                'schema' => $schema
-                            ]
-                        ]
-                    ]
-                ];
-            }
-        }
-
-        // Fall back to a default response
-        return [
-            200 => [
-                'description' => 'Successful response',
-                'content' => [
-                    'application/json' => [
-                        'schema' => [
-                            'type' => 'object'
-                        ]
-                    ]
+            $operation['responses']['200']['content'] = [
+                'application/json' => [
+                    'schema' => $schema
                 ]
-            ]
-        ];
+            ];
+        }
+
     }
 
     /**
