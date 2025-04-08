@@ -28,437 +28,152 @@ class ResourceParser
 
         // Get the reflection class
         $reflectionClass = new ReflectionClass($resourceClass);
-        
+
         // Check for ApiResource attribute first
         $apiResourceAttributes = $reflectionClass->getAttributes(ApiResource::class, ReflectionAttribute::IS_INSTANCEOF);
-        
+
         if (!empty($apiResourceAttributes)) {
             $apiResource = $apiResourceAttributes[0]->newInstance();
-            return $this->processApiResourceAttribute($apiResource, $resourceClass);
+            $data = $this->detectAndAddAllRelations($apiResource->model);
+            return [
+                "type" => "object",
+                "properties" => $data
+            ];
         }
-
-        // Determine if the resource is a collection
-        $isCollection = is_subclass_of($resourceClass, ResourceCollection::class);
-
-        // Try to find the toArray method which defines the resource structure
-        if (!$reflectionClass->hasMethod('toArray')) {
-            // Fall back to parent method if not overridden
-            return $this->guessResourceSchema($resourceClass, $isCollection);
-        }
-
-        // Analyze the toArray method for schema information
-        $toArrayMethod = $reflectionClass->getMethod('toArray');
-
-        // If the method is not overridden in the class, use our guessing mechanism
-        if ($toArrayMethod->class !== $resourceClass) {
-            return $this->guessResourceSchema($resourceClass, $isCollection);
-        }
-
-        // Check if we can extract a model from the resource
-        $modelClass = $this->extractModelFromResource($resourceClass);
-
-        // If we have a model class, we can use it to determine the schema
-        if ($modelClass) {
-            return $this->buildSchemaFromModel($modelClass, $isCollection);
-        }
-
-        // Last resort: provide a generic schema
-        return $this->buildGenericSchema($isCollection);
+        return [];
     }
-    
+
+
     /**
-     * Process the ApiResource attribute to build a schema
+     * Detect and add all relations from a model by parsing docblock properties
      */
-    protected function processApiResourceAttribute(ApiResource $apiResource, string $resourceClass): array
-    {
-        // Check if we have an explicit model
-        if ($apiResource->model && class_exists($apiResource->model)) {
-            $schema = $this->buildSchemaFromModel(
-                $apiResource->model, 
-                $apiResource->isCollection || is_subclass_of($resourceClass, ResourceCollection::class),
-                $apiResource->isPaginated
-            );
-            
-            // If we have relations defined, process them
-            if (!empty($apiResource->relations) || $apiResource->includeAllRelations) {
-                $schema = $this->includeRelations($schema, $apiResource);
-            }
-            
-            return $schema;
-        }
-        
-        // If we have a custom schema defined, use that
-        if (!empty($apiResource->schema)) {
-            $schema = $apiResource->schema;
-            
-            // Add description if available
-            if ($apiResource->description) {
-                $schema['description'] = $apiResource->description;
-            }
-            
-            // Wrap in collection if needed
-            if ($apiResource->isCollection || is_subclass_of($resourceClass, ResourceCollection::class)) {
-                if ($apiResource->isPaginated) {
-                    return $this->wrapInPaginatedCollection($schema);
-                } else {
-                    return [
-                        'type' => 'array',
-                        'items' => $schema
-                    ];
-                }
-            }
-            
-            return $schema;
-        }
-        
-        // Fall back to default parsing logic
-        $isCollection = $apiResource->isCollection || is_subclass_of($resourceClass, ResourceCollection::class);
-        $modelClass = $this->extractModelFromResource($resourceClass);
-        
-        if ($modelClass) {
-            $schema = $this->buildSchemaFromModel($modelClass, $isCollection, $apiResource->isPaginated);
-            
-            // If we have relations defined, process them
-            if (!empty($apiResource->relations) || $apiResource->includeAllRelations) {
-                $schema = $this->includeRelations($schema, $apiResource);
-            }
-            
-            return $schema;
-        }
-        
-        return $this->buildGenericSchema($isCollection, $apiResource->isPaginated);
-    }
-    
-    /**
-     * Include relations in the schema
-     */
-    protected function includeRelations(array $schema, ApiResource $apiResource): array
-    {
-        // Only add relations to object schemas in the correct place
-        if (!isset($schema['properties']) && isset($schema['items']['properties'])) {
-            // For collections, we need to add to the items schema
-            return $this->addRelationsToProperties($schema, $schema['items']['properties'], $apiResource);
-        } elseif (isset($schema['properties'])) {
-            // For single resources
-            return $this->addRelationsToProperties($schema, $schema['properties'], $apiResource);
-        } elseif (isset($schema['properties']['data']['items']['properties'])) {
-            // For paginated collections
-            return $this->addRelationsToProperties($schema, $schema['properties']['data']['items']['properties'], $apiResource);
-        }
-        
-        return $schema;
-    }
-    
-    /**
-     * Add relations to the properties of a schema
-     */
-    protected function addRelationsToProperties(array $schema, array &$properties, ApiResource $apiResource): array
-    {
-        // Add explicitly defined relations
-        foreach ($apiResource->relations as $relationName => $relationInfo) {
-            // Handle both string format and array format
-            if (is_string($relationInfo)) {
-                $resourceClass = $relationInfo;
-                $isCollection = false;
-            } else {
-                $resourceClass = $relationInfo['resource'] ?? null;
-                $isCollection = $relationInfo['isCollection'] ?? false;
-            }
-            
-            if (!$resourceClass || !class_exists($resourceClass)) {
-                continue;
-            }
-            
-            // Parse the resource to get its schema
-            $relationSchema = $this->parseResource($resourceClass);
-            
-            if (empty($relationSchema)) {
-                continue;
-            }
-            
-            // If the relation resource is a collection but not marked as such, wrap it
-            if ($isCollection && !isset($relationSchema['type']) && !isset($relationSchema['items'])) {
-                $relationSchema = [
-                    'type' => 'array',
-                    'items' => $relationSchema
-                ];
-            }
-            
-            // Add to properties
-            $properties[$relationName] = $relationSchema;
-        }
-        
-        // If includeAllRelations is true and we have a model, try to detect all relations
-        if ($apiResource->includeAllRelations && $apiResource->model && class_exists($apiResource->model)) {
-            $this->detectAndAddAllRelations($properties, $apiResource->model);
-        }
-        
-        return $schema;
-    }
-    
-    /**
-     * Detect and add all relations from a model
-     */
-    protected function detectAndAddAllRelations(array &$properties, string $modelClass): void
+    protected function detectAndAddAllRelations(string $modelClass): ?array
     {
         if (!class_exists($modelClass)) {
-            return;
+            return null;
         }
-        
+
         try {
             // Create an instance of the model
             $model = new $modelClass();
             $reflectionClass = new ReflectionClass($modelClass);
-            
-            // Get all public methods
-            $methods = $reflectionClass->getMethods(ReflectionMethod::IS_PUBLIC);
-            
-            foreach ($methods as $method) {
-                // Skip constructor, non-instance methods and methods with parameters
-                if ($method->isConstructor() || $method->isStatic() || $method->getNumberOfRequiredParameters() > 0) {
-                    continue;
+            $docComment = $reflectionClass->getDocComment();
+
+            if (!$docComment) {
+                return null;
+            }
+
+            $lines = explode("\n", $docComment);
+
+            $docProperties = [];
+            $methods = [];
+            $phpDocType = [];
+
+            // Extract properties and methods from docblock
+            foreach ($lines as $line) {
+                $line = trim($line, " \t\n\r\0\x0B*"); // clean up line
+                if (str_starts_with($line, '@property')) {
+                    $docProperties[] = $line;
+                } elseif (str_starts_with($line, '@method')) {
+                    $methods[] = $line;
                 }
-                
-                $methodName = $method->getName();
-                
-                // Try to detect if this is a relation method
-                // We're looking for methods that return relationship objects
-                $returnType = $method->getReturnType();
-                if ($returnType) {
-                    $returnTypeName = $returnType->getName();
-                    
-                    // Check if the return type is a relation class
-                    $relationClasses = [
-                        'Illuminate\Database\Eloquent\Relations\HasOne',
-                        'Illuminate\Database\Eloquent\Relations\HasMany',
-                        'Illuminate\Database\Eloquent\Relations\BelongsTo',
-                        'Illuminate\Database\Eloquent\Relations\BelongsToMany',
-                        'Illuminate\Database\Eloquent\Relations\MorphTo',
-                        'Illuminate\Database\Eloquent\Relations\MorphOne',
-                        'Illuminate\Database\Eloquent\Relations\MorphMany',
-                        'Illuminate\Database\Eloquent\Relations\MorphToMany',
-                        'Illuminate\Database\Eloquent\Relations\HasOneThrough',
-                        'Illuminate\Database\Eloquent\Relations\HasManyThrough',
+            }
+
+            // Process properties from docblock
+            foreach ($docProperties as $property) {
+                preg_match('/@property(-read)?\s+([\w\\\\|]+)\s+\$(\w+)/', $property, $matches);
+                if ($matches) {
+                    $propName = $matches[3];
+                    $propType = $matches[2];
+                    $isReadOnly = !empty($matches[1]); // Determine if it's a read-only property
+
+                    $phpDocType[] = [
+                        'name' => $propName,
+                        'type' => $propType,
+                        'readonly' => !empty($matches[1])
                     ];
-                    
-                    $isRelation = false;
-                    foreach ($relationClasses as $relationClass) {
-                        if (is_a($returnTypeName, $relationClass, true)) {
-                            $isRelation = true;
-                            break;
+
+                    // Add property to schema based on its type
+                    if (str_contains($propType, 'Collection') || str_contains($propType, '[]')) {
+                        // This is a collection/array property
+                        // Try to extract the model type from collection
+                        $modelType = null;
+                        if (preg_match('/Collection<([\w\\\\]+)>/', $propType, $typeMatches)) {
+                            $modelType = $typeMatches[1];
+                        } elseif (preg_match('/([\w\\\\]+)\[\]/', $propType, $typeMatches)) {
+                            $modelType = $typeMatches[1];
                         }
-                    }
-                    
-                    if ($isRelation) {
-                        // This method returns a relation
-                        $isToMany = $this->isToManyRelation($returnTypeName);
-                        
-                        // Try to guess the related model from PHPDoc
-                        $docComment = $method->getDocComment();
-                        $relatedModel = $this->extractModelFromDocComment($docComment);
-                        
-                        if ($relatedModel && class_exists($relatedModel)) {
-                            $relationSchema = $this->buildSchemaFromModel($relatedModel, false);
-                            
-                            if ($isToMany) {
-                                $properties[$methodName] = [
-                                    'type' => 'array',
-                                    'items' => $relationSchema
-                                ];
-                            } else {
-                                $properties[$methodName] = $relationSchema;
-                            }
+
+                        if ($modelType && class_exists($modelType)) {
+                            $itemSchema = $this->buildSchemaFromModel($modelType, false);
+                            $properties[$propName] = [
+                                'type' => 'array',
+                                'items' => $itemSchema
+                            ];
                         } else {
-                            // If we couldn't determine the model, add a generic schema
-                            if ($isToMany) {
-                                $properties[$methodName] = [
-                                    'type' => 'array',
-                                    'items' => [
-                                        'type' => 'object'
-                                    ]
-                                ];
-                            } else {
-                                $properties[$methodName] = [
-                                    'type' => 'object'
-                                ];
-                            }
+                            $properties[$propName] = [
+                                'type' => 'array',
+                                'items' => ['type' => 'object']
+                            ];
                         }
+                    } elseif (strpos($propType, '\\') !== false) {
+                        // This looks like a class name
+                        if (class_exists($propType)) {
+                            $properties[$propName] = $this->buildSchemaFromModel($propType, false);
+                        } else {
+                            $properties[$propName] = ['type' => 'object'];
+                        }
+                    } else {
+                        // Convert PHP types to JSON Schema types
+                        $schemaType = 'string';
+                        $format = null;
+
+                        switch ($propType) {
+                            case 'int':
+                            case 'integer':
+                                $schemaType = 'integer';
+                                break;
+                            case 'float':
+                            case 'double':
+                                $schemaType = 'number';
+                                break;
+                            case 'bool':
+                            case 'boolean':
+                                $schemaType = 'boolean';
+                                break;
+                            case 'array':
+                                $schemaType = 'array';
+                                break;
+                            case 'object':
+                                $schemaType = 'object';
+                                break;
+                            case 'string':
+                                // Check for common date fields
+                                if (str_contains($propName, 'date') || str_contains($propName, 'time') ||
+                                    str_ends_with($propName, 'at') || $propName === 'created_at' || $propName === 'updated_at') {
+                                    $format = 'date-time';
+                                }
+                                break;
+                        }
+
+                        $property = ['type' => $schemaType];
+                        if ($format) {
+                            $property['format'] = $format;
+                        }
+
+                        $properties[$propName] = $property;
                     }
                 }
             }
+
+            return $properties;
         } catch (\Exception $e) {
-            // If anything goes wrong, just continue
+            echo $e->getMessage();
+            return [];
         }
     }
-    
-    /**
-     * Check if a relation type is a "to-many" relation
-     */
-    protected function isToManyRelation(string $relationClass): bool
-    {
-        $toManyRelations = [
-            'Illuminate\Database\Eloquent\Relations\HasMany',
-            'Illuminate\Database\Eloquent\Relations\BelongsToMany',
-            'Illuminate\Database\Eloquent\Relations\MorphMany',
-            'Illuminate\Database\Eloquent\Relations\MorphToMany',
-            'Illuminate\Database\Eloquent\Relations\HasManyThrough',
-        ];
-        
-        foreach ($toManyRelations as $toManyRelation) {
-            if (is_a($relationClass, $toManyRelation, true)) {
-                return true;
-            }
-        }
-        
-        return false;
-    }
 
-    /**
-     * Extract model class and collection type from PHPDoc comment
-     * 
-     * @param string|null $docComment The PHPDoc comment to analyze
-     * @return array{model: ?string, isCollection: bool} Contains model class name and whether it's a collection
-     */
-    protected function extractModelFromDocComment(?string $docComment): array
-    {
-        $result = [
-            'model' => null,
-            'isCollection' => false
-        ];
-        
-        if (!$docComment) {
-            return $result;
-        }
-        
-        // Parse Laravel IDE Helper DocBlocks for relationship properties
-        // Example: @property-read \Illuminate\Database\Eloquent\Collection<\App\Models\Comment> $comments
-        if (preg_match("/@property(?:-read|-write)?\s+\\?Illuminate\\Database\\\Eloquent\\\Collection\s*<\s*([\\\w]+)\s*>\s+\$([\w]+)/", $docComment, $matches)) {
-            $relatedModel = $matches[1];
-            if (class_exists($relatedModel)) {
-                $result['model'] = $relatedModel;
-                $result['isCollection'] = true;
-                return $result;
-            }
-        }
-        
-        // Parse Laravel IDE Helper DocBlocks for single model relationships
-        // Example: @property-read \App\Models\Profile|null $profile
-        if (preg_match('/@property(?:-read|-write)?\s+([\\\w]+)(?:\|null)?\s+\$([\w]+)/', $docComment, $matches)) {
-            $relatedModel = $matches[1];
-            // Skip collections, already handled above
-            if (class_exists($relatedModel) && $relatedModel !== 'Illuminate\\Database\\Eloquent\\Collection') {
-                $result['model'] = $relatedModel;
-                $result['isCollection'] = false;
-                return $result;
-            }
-        }
-        
-        // Look for common patterns in PHPDoc for relation return types
-        // @return HasMany|BelongsToMany|MorphMany|etc<App\Models\SomeModel>
-        if (preg_match('/@return\s+(?:HasMany|BelongsToMany|MorphMany|MorphToMany|HasManyThrough)[\s<]([\\\w]+)[\s>]/', $docComment, $matches)) {
-            $result['model'] = $matches[1];
-            $result['isCollection'] = true;
-            return $result;
-        }
-        
-        // @return HasOne|BelongsTo|MorphOne|etc<App\Models\SomeModel>
-        if (preg_match('/@return\s+(?:HasOne|BelongsTo|MorphTo|MorphOne|HasOneThrough)[\s<]([\\\w]+)[\s>]/', $docComment, $matches)) {
-            $result['model'] = $matches[1];
-            $result['isCollection'] = false;
-            return $result;
-        }
-        
-        // @return Illuminate\Database\Eloquent\Collection<App\Models\SomeModel>
-        if (preg_match('/@return\s+(?:\\)?Illuminate\\Database\\\Eloquent\\\Collection[\s<]([\\\w]+)[\s>]+)/', $docComment, $matches)) {
-            $result['model'] = $matches[1];
-            $result['isCollection'] = true;
-            return $result;
-        }
-        
-        // @return Collection|SomeModel[]
-        // @return Collection<SomeModel>
-        if (preg_match('/@return\s+Collection[\s\|<]([\\\w]+)(?:\[]|>|\sof\s)/', $docComment, $matches)) {
-            $result['model'] = $matches[1];
-            $result['isCollection'] = true;
-            return $result;
-        }
-        
-        // @return SomeModel[]
-        if (preg_match('/@return\s+([\\\w]+)\[]/', $docComment, $matches)) {
-            $result['model'] = $matches[1];
-            $result['isCollection'] = true;
-            return $result;
-        }
-        
-        // Look for @mixin or @see tags that might indicate the model
-        if (preg_match('/@mixin\s+([^\s]+)/', $docComment, $matches)) {
-            $potentialModelClass = $matches[1];
-            if (class_exists($potentialModelClass)) {
-                $result['model'] = $potentialModelClass;
-            }
-        }
 
-        if (preg_match('/@see\s+([^\s]+)/', $docComment, $matches)) {
-            $potentialModelClass = $matches[1];
-            if (class_exists($potentialModelClass)) {
-                $result['model'] = $potentialModelClass;
-            }
-        }
-        
-        // Check for collection hint with @var
-        if (preg_match('/@var\s+([^\s]+)\[\]/', $docComment, $matches)) {
-            $potentialModelClass = $matches[1];
-            if (class_exists($potentialModelClass)) {
-                $result['model'] = $potentialModelClass;
-                $result['isCollection'] = true;
-            }
-        }
-        
-        return $result;
-    }
-
-    protected function extractModelFromResource(string $resourceClass): ?string
-    {
-        // Check class documentation for model hints
-        $reflectionClass = new ReflectionClass($resourceClass);
-        $docComment = $reflectionClass->getDocComment();
-
-        if ($docComment) {
-            // Look for @mixin or @see tags that might indicate the model
-            if (preg_match('/@mixin\s+([^\s]+)/', $docComment, $matches)) {
-                $potentialModelClass = $matches[1];
-                if (class_exists($potentialModelClass)) {
-                    return $potentialModelClass;
-                }
-            }
-
-            if (preg_match('/@see\s+([^\s]+)/', $docComment, $matches)) {
-                $potentialModelClass = $matches[1];
-                if (class_exists($potentialModelClass)) {
-                    return $potentialModelClass;
-                }
-            }
-        }
-
-        // Try to guess model from resource name convention
-        $resourceClassName = class_basename($resourceClass);
-        $potentialModelName = str_replace(['Resource', 'Collection'], '', $resourceClassName);
-        
-        // Check common model namespaces
-        $potentialNamespaces = [
-            'App\\Models\\',
-            'App\\',
-        ];
-
-        foreach ($potentialNamespaces as $namespace) {
-            $potentialModelClass = $namespace . $potentialModelName;
-            if (class_exists($potentialModelClass)) {
-                return $potentialModelClass;
-            }
-        }
-
-        return null;
-    }
 
     /**
      * Build a schema based on a model's properties
@@ -467,10 +182,10 @@ class ResourceParser
     {
         $reflectionClass = new ReflectionClass($modelClass);
         $properties = $reflectionClass->getProperties(ReflectionProperty::IS_PUBLIC);
-        
+
         // Try to get fillable properties if available
         $fillableProperties = $this->getFillableProperties($reflectionClass);
-        
+
         // If we have fillable properties, use those instead of public properties
         if (!empty($fillableProperties)) {
             $propertyNames = $fillableProperties;
@@ -479,7 +194,7 @@ class ResourceParser
             $propertyNames = array_map(function ($prop) {
                 return $prop->getName();
             }, $properties);
-            
+
             // Add commonly expected model properties
             $commonProps = ['id', 'created_at', 'updated_at'];
             foreach ($commonProps as $prop) {
@@ -521,12 +236,12 @@ class ResourceParser
     protected function getFillableProperties(ReflectionClass $reflectionClass): array
     {
         $fillable = [];
-        
+
         // Check if the class has a fillable property
         if ($reflectionClass->hasProperty('fillable')) {
             $fillableProperty = $reflectionClass->getProperty('fillable');
             $fillableProperty->setAccessible(true);
-            
+
             // We need to create an instance of the model to get the property value
             try {
                 $model = $reflectionClass->newInstanceWithoutConstructor();
@@ -536,7 +251,7 @@ class ResourceParser
                 $fillable = [];
             }
         }
-        
+
         return $fillable;
     }
 
@@ -549,48 +264,36 @@ class ResourceParser
         if ($propertyName === 'id') {
             return ['type' => 'integer', 'example' => 1];
         }
-        
+
         if (str_ends_with($propertyName, '_id')) {
             return ['type' => 'integer', 'example' => 1];
         }
-        
+
         if (str_ends_with($propertyName, '_at') || str_ends_with($propertyName, '_date')) {
             return ['type' => 'string', 'format' => 'date-time', 'example' => date('Y-m-d H:i:s')];
         }
-        
+
         if ($propertyName === 'email') {
             return ['type' => 'string', 'format' => 'email', 'example' => 'user@example.com'];
         }
-        
+
         if (str_contains($propertyName, 'url') || str_contains($propertyName, 'link')) {
             return ['type' => 'string', 'format' => 'uri', 'example' => 'https://example.com'];
         }
-        
+
         if (str_starts_with($propertyName, 'is_') || str_starts_with($propertyName, 'has_')) {
             return ['type' => 'boolean', 'example' => true];
         }
-        
+
         if (str_contains($propertyName, 'amount') || str_contains($propertyName, 'price') || str_contains($propertyName, 'cost')) {
             return ['type' => 'number', 'format' => 'float', 'example' => 99.99];
         }
-        
+
         // Default to string type
         return ['type' => 'string', 'example' => 'Example ' . str_replace('_', ' ', $propertyName)];
     }
 
-    /**
-     * Guess a resource schema when we can't determine it from the class
-     */
-    protected function guessResourceSchema(string $resourceClass, bool $isCollection): array
-    {
-        $modelClass = $this->extractModelFromResource($resourceClass);
-        
-        if ($modelClass) {
-            return $this->buildSchemaFromModel($modelClass, $isCollection);
-        }
-        
-        return $this->buildGenericSchema($isCollection);
-    }
+
 
     /**
      * Wrap a schema in a paginated collection format
@@ -639,7 +342,7 @@ class ResourceParser
             ]
         ];
     }
-    
+
     /**
      * Build a generic schema for when we can't determine resource structure
      */
@@ -653,7 +356,7 @@ class ResourceParser
                 'updated_at' => ['type' => 'string', 'format' => 'date-time', 'example' => date('Y-m-d H:i:s')],
             ]
         ];
-        
+
         if ($isCollection) {
             if ($isPaginated) {
                 return $this->wrapInPaginatedCollection($baseSchema);
@@ -664,7 +367,7 @@ class ResourceParser
                 ];
             }
         }
-        
+
         return $baseSchema;
     }
 }
